@@ -1,119 +1,148 @@
 
 const crypto = require('node:crypto');
 
-const reply = (statusCode, body) => ({
+const WEBHOOK_URL = 'https://voluble-monstera-2321ac.netlify.app/.netlify/functions/payment-webhook';
+const DESTINATION = 'lightitupmackay1@outlook.com';
+const SQUARE_VERSION = '2025-10-16';
+
+const response = (statusCode, message) => ({
   statusCode,
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(body)
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({message})
 });
 
 exports.handler = async (event) => {
-  if (event.httpMethod !== 'POST') {
-    return reply(405, { error: 'Method not allowed' });
-  }
+  if (event.httpMethod !== 'POST')
+    return response(405, 'Method not allowed');
+
+  const signatureKey = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
+  const squareToken = process.env.SQUARE_ACCESS_TOKEN;
+  const resendKey = process.env.RESEND_API_KEY;
+
+  if (!signatureKey || !squareToken || !resendKey)
+    return response(503, 'Missing configuration');
+
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body || '', 'base64').toString('utf8')
+    : (event.body || '');
+
+  const signature =
+    event.headers?.['x-square-hmacsha256-signature'] ||
+    event.headers?.['X-Square-HmacSha256-Signature'] ||
+    '';
+
+  const expected = crypto
+    .createHmac('sha256', signatureKey)
+    .update(WEBHOOK_URL + rawBody)
+    .digest('base64');
+
+  const supplied = Buffer.from(signature);
+  const computed = Buffer.from(expected);
+
+  if (
+    supplied.length !== computed.length ||
+    !crypto.timingSafeEqual(supplied, computed)
+  ) return response(403, 'Invalid signature');
 
   try {
-    const key = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
-    const token = process.env.SQUARE_ACCESS_TOKEN;
-    const emailKey = process.env.RESEND_API_KEY;
-    const url =
-      'https://voluble-monstera-2321ac.netlify.app/.netlify/functions/payment-webhook';
+    const notification = JSON.parse(rawBody);
 
-    if (!key || !token || !emailKey) {
-      return reply(503, { error: 'Configuration missing' });
-    }
-
-    const signature =
-      event.headers['x-square-hmacsha256-signature'] ||
-      event.headers['X-Square-HmacSha256-Signature'];
-
-    const body = event.body || '';
-    const expected = crypto
-      .createHmac('sha256', key)
-      .update(url + body)
-      .digest('base64');
-
-    const a = Buffer.from(signature || '');
-    const b = Buffer.from(expected);
-
-    if (a.length !== b.length ||
-        !crypto.timingSafeEqual(a, b)) {
-      return reply(403, { error: 'Invalid signature' });
-    }
-
-    const notification = JSON.parse(body);
-
-    if (notification.type !== 'payment.updated') {
-      return reply(200, { received: true });
-    }
+    if (notification.type !== 'payment.updated')
+      return response(200, 'Ignored');
 
     const payment = notification.data?.object?.payment;
 
-    if (payment?.status !== 'COMPLETED' || !payment.order_id) {
-      return reply(200, { received: true });
-    }
+    if (
+      !payment ||
+      payment.status !== 'COMPLETED' ||
+      !payment.order_id
+    ) return response(200, 'Ignored');
 
-    const orderResponse = await fetch(
+    const squareResponse = await fetch(
       `https://connect.squareup.com/v2/orders/${encodeURIComponent(payment.order_id)}`,
       {
         headers: {
-          Authorization: `Bearer ${token}`,
-          'Square-Version': '2025-10-16'
+          Authorization: `Bearer ${squareToken}`,
+          'Square-Version': SQUARE_VERSION
         }
       }
     );
 
-    if (!orderResponse.ok) {
-      throw new Error('Could not retrieve Square order');
-    }
+    if (!squareResponse.ok)
+      throw new Error(`Square order fetch failed: ${squareResponse.status}`);
 
-    const { order } = await orderResponse.json();
-    const meta = order.metadata || {};
+    const {order} = await squareResponse.json();
 
-    const items = (order.line_items || []).map(item =>
-      `${item.name} x ${item.quantity}\n${item.note || ''}`
-    ).join('\n\n');
+    if (!order) throw new Error('Square order missing');
 
-    const message = [
+    const metadata = order.metadata || {};
+
+    const balloons = (order.line_items || [])
+      .map((item, i) => [
+        `Balloon ${i + 1}: ${item.name || 'Elf Balloon'} x ${item.quantity || '1'}`,
+        item.note || 'No personalisation supplied'
+      ].join('\n'))
+      .join('\n\n');
+
+    const customerEmail =
+      metadata.customer_email ||
+      order.fulfillments?.[0]?.pickup_details?.recipient?.email_address ||
+      payment.buyer_email_address ||
+      'Not available';
+
+    const notes =
+      metadata.notes ||
+      'See balloon notes above (if supplied)';
+
+    const content = [
       'PAID ELF BALLOON ORDER',
       '',
       `Order: ${order.reference_id || order.id}`,
-      `Customer: ${meta.customer_name || 'Not provided'}`,
-      `Phone: ${meta.customer_phone || 'Not provided'}`,
-      `Email: ${meta.customer_email || 'Not provided'}`,
-      `Collection: ${meta.collection_date || '30 November 2026'}`,
+      `Customer: ${metadata.customer_name || 'Not available'}`,
+      `Phone: ${metadata.customer_phone || 'Not available'}`,
+      `Email: ${customerEmail}`,
+      `Collection: ${metadata.collection_date || '30 November 2026'}`,
       '',
       'BALLOONS:',
-      items,
+      balloons || 'No balloon details available',
       '',
-      `SPECIAL REQUESTS: ${meta.notes || 'None'}`,
+      `ADDITIONAL NOTES: ${notes}`,
       '',
-      `Payment: ${payment.status}`,
-      `Square payment ID: ${payment.id}`
+      `Payment status: ${payment.status}`,
+      `Payment ID: ${payment.id}`
     ].join('\n');
 
-    const result = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${emailKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: 'Light It Up Mackay <onboarding@resend.dev>',
-        to: ['lightitupmackay1@outlook.com'],
-        subject: `PAID Elf Balloon Order - ${order.reference_id || order.id}`,
-        text: message
-      })
-    });
+    const emailResponse = await fetch(
+      'https://api.resend.com/emails',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendKey}`,
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `elf-order-${payment.id}`
+        },
+        body: JSON.stringify({
+          from: 'Light It Up Mackay <onboarding@resend.dev>',
+          to: [DESTINATION],
+          subject: `PAID Elf Balloon Order - ${order.reference_id || order.id}`,
+          text: content
+        })
+      }
+    );
 
-    if (!result.ok) {
-      throw new Error('Email delivery request failed');
+    if (!emailResponse.ok) {
+      console.error(
+        'Resend request failed',
+        emailResponse.status,
+        await emailResponse.text()
+      );
+      throw new Error('Email request failed');
     }
 
-    return reply(200, { received: true });
+    return response(200, 'Processed');
 
   } catch (error) {
-    console.error('Webhook processing error:', error.message);
-    return reply(500, { error: 'Processing failed' });
+    console.error('Webhook processing error', error.message);
+    return response(500, 'Processing failed');
   }
 };
