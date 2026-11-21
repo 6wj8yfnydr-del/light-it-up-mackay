@@ -38,14 +38,18 @@ exports.handler = async (event) => {
           !b.names.trim()
       )
     ) {
-      return reply(400, { error: 'Please complete all required fields.' });
+      return reply(400, {
+        error: 'Please complete all required fields.'
+      });
     }
 
     const token = process.env.SQUARE_ACCESS_TOKEN;
     const locationId = process.env.SQUARE_LOCATION_ID;
 
     if (!token || !locationId) {
-      return reply(503, { error: 'Checkout is not configured.' });
+      return reply(503, {
+        error: 'Checkout is not configured.'
+      });
     }
 
     const line_items = balloons.map((b) => ({
@@ -72,7 +76,8 @@ exports.handler = async (event) => {
           customer_name: name.trim().slice(0, 255),
           customer_phone: phone.trim().slice(0, 255),
           customer_email: email.trim().slice(0, 255),
-          customer_notes: notes.trim().slice(0, 255)
+          customer_notes:
+            notes.trim().slice(0, 255) || 'No additional notes'
         }
       },
       checkout_options: {
@@ -97,16 +102,24 @@ exports.handler = async (event) => {
     const data = await response.json();
 
     if (!response.ok || !data.payment_link?.url) {
-      console.error('Square checkout error', response.status, data);
+      console.error(
+        'Square checkout error',
+        response.status,
+        data
+      );
+
       return reply(502, {
         error: 'Unable to create checkout. Please try again.'
       });
     }
 
-    return reply(200, { url: data.payment_link.url });
+    return reply(200, {
+      url: data.payment_link.url
+    });
 
   } catch (error) {
     console.error('Checkout error', error);
+
     return reply(500, {
       error: 'Checkout temporarily unavailable.'
     });
